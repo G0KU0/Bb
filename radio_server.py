@@ -4,25 +4,104 @@ import threading
 import queue
 import time
 import sys
+import os
 import base64
 from flask import (
     Flask, render_template_string, request, redirect, jsonify
 )
 
 # =============================================
-#  BEÁLLÍTÁSOK / SETTINGS
+#  BEÁLLÍTÁSOK — Render.com env vars
 # =============================================
-SHOUTCAST_HOST     = 'uk3freenew.listen2myradio.com'
-SHOUTCAST_PORT     = 31822
-SHOUTCAST_PASSWORD = '2002'
-BITRATE            = 128
-STATION_NAME       = 'Szaby Radio'
-STATION_GENRE      = 'Various'
-STATION_URL        = 'http://szaby.radio12345.com'
-WEB_PORT           = 5000
-# =============================================
+SHOUTCAST_HOST     = os.environ.get(
+    'SHOUTCAST_HOST', 'uk3freenew.listen2myradio.com'
+)
+SHOUTCAST_PORT     = int(os.environ.get('SHOUTCAST_PORT', '31822'))
+SHOUTCAST_PASSWORD = os.environ.get('SHOUTCAST_PASSWORD', '2002')
+BITRATE            = int(os.environ.get('BITRATE', '128'))
+STATION_NAME       = os.environ.get('STATION_NAME', 'Szaby Radio')
+STATION_GENRE      = os.environ.get('STATION_GENRE', 'Various')
+STATION_URL        = os.environ.get(
+    'STATION_URL', 'http://szaby.radio12345.com'
+)
+
+# Render.com a PORT env variable-t adja
+WEB_PORT = int(os.environ.get('PORT', '5000'))
 
 app = Flask(__name__)
+
+
+# =============================================
+#  JS RUNTIME DETEKCIÓ
+# =============================================
+def detect_js_runtime():
+    for name, cmd in [
+        ('nodejs', ['node', '--version']),
+        ('deno',   ['deno', '--version']),
+    ]:
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=5
+            )
+            if r.returncode == 0:
+                ver = r.stdout.decode().strip()
+                print(f'  ✅ JS Runtime: {name} {ver}')
+                return name
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    print('  ⚠️  Nincs JS runtime!')
+    return None
+
+
+def check_ffmpeg():
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            ver = r.stdout.decode().split('\n')[0]
+            print(f'  ✅ FFmpeg: {ver[:60]}')
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    print('  ❌ FFmpeg nem található!')
+    return False
+
+
+def check_ytdlp():
+    try:
+        r = subprocess.run(
+            ['yt-dlp', '--version'],
+            capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            ver = r.stdout.decode().strip()
+            print(f'  ✅ yt-dlp: {ver}')
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    print('  ❌ yt-dlp nem található!')
+    return False
+
+
+# Indításkor ellenőrzés
+print()
+print('╔═══════════════════════════════════════════╗')
+print('║  🔧  Rendszer ellenőrzés...               ║')
+print('╚═══════════════════════════════════════════╝')
+JS_RUNTIME = detect_js_runtime()
+check_ffmpeg()
+check_ytdlp()
+print()
+
+
+def get_ytdlp_base():
+    args = ['yt-dlp']
+    if JS_RUNTIME:
+        args.extend(['--js-runtimes', JS_RUNTIME])
+    args.append('--no-playlist')
+    return args
 
 
 # =============================================
@@ -33,7 +112,10 @@ class RadioState:
         self.song_queue    = queue.Queue()
         self.display_queue = []
         self.lock          = threading.Lock()
-        self.current       = {'title': 'Nincs zene lejátszás alatt', 'url': ''}
+        self.current       = {
+            'title': 'Nincs zene lejátszás alatt',
+            'url': ''
+        }
         self.streaming     = False
         self.connected     = False
         self.conn_method   = ''
@@ -42,6 +124,7 @@ class RadioState:
         self.yt_proc       = None
         self.skip_event    = threading.Event()
         self.logs          = []
+        self.total_played  = 0
 
     def log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -49,237 +132,169 @@ class RadioState:
         self.logs.append(entry)
         if len(self.logs) > 500:
             self.logs = self.logs[-300:]
-        print(entry)
+        print(entry, flush=True)
 
 R = RadioState()
 
 
 # =============================================
-#  SHOUTCAST MULTI-PROTOCOL SOURCE CONNECTION
+#  SHOUTCAST SOURCE CONNECTION
 # =============================================
 class ShoutcastSource:
-    """
-    Támogatott protokollok:
-      1) SHOUTcast v1 legacy (port+1) — DNAS v2 kompatibilis
-      2) SHOUTcast v2 / Icecast SOURCE metódus
-      3) SHOUTcast v1 legacy (base port)
-      4) SHOUTcast v1 alternatív (\\n line ending)
-    """
-
     def __init__(self):
         self.sock  = None
         self.alive = False
 
     def connect(self):
-        """Végigpróbálja az összes csatlakozási módszert"""
-
         methods = [
-            ('SHOUTcast v1 Legacy (port+1)',   self._try_v1_port_plus),
-            ('SHOUTcast v2 SOURCE (base port)', self._try_v2_source),
-            ('SHOUTcast v1 Legacy (base port)', self._try_v1_base),
-            ('SHOUTcast v1 Alt (\\n ending)',   self._try_v1_alt),
-            ('Icecast PUT kompatibilis',        self._try_icecast_put),
+            ('SHOUTcast v1 (port+1)',
+             self._try_v1_port_plus),
+            ('SHOUTcast v2 SOURCE',
+             self._try_v2_source),
+            ('SHOUTcast v1 (base)',
+             self._try_v1_base),
+            ('Icecast PUT',
+             self._try_icecast_put),
         ]
 
         for name, method in methods:
             R.log(f'🔌 Próba: {name}...')
             try:
                 if method():
-                    self.alive     = True
-                    R.connected    = True
-                    R.conn_method  = name
-                    R.log(f'✅ SIKER! Csatlakozva: {name}')
+                    self.alive    = True
+                    R.connected   = True
+                    R.conn_method = name
+                    R.log(f'✅ Csatlakozva: {name}')
                     return True
                 else:
-                    R.log(f'   ✗ {name} — nem sikerült')
+                    R.log(f'   ✗ {name}')
             except Exception as e:
-                R.log(f'   ✗ {name} — hiba: {e}')
+                R.log(f'   ✗ {name}: {e}')
             self._close()
 
-        R.log('❌ Egyik csatlakozási módszer sem működött!')
-        R.log('   ► Ellenőrizd, hogy a szerver BE VAN-E KAPCSOLVA')
+        R.log('❌ Nem sikerült csatlakozni!')
+        R.log('   → Ellenőrizd, hogy a szerver BE van-e kapcsolva')
         R.log('     a listen2myradio.com panelen!')
         R.connected = False
         return False
 
-    # ---- Method 1: SHOUTcast v1 on port+1 ----
     def _try_v1_port_plus(self):
-        """
-        SHOUTcast DNAS v2 legacy kompatibilitás:
-        A source/DJ port = base_port + 1
-        """
-        source_port = SHOUTCAST_PORT + 1
-        R.log(f'   Csatlakozás: {SHOUTCAST_HOST}:{source_port}')
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        port = SHOUTCAST_PORT + 1
+        R.log(f'   → {SHOUTCAST_HOST}:{port}')
+        self.sock = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        )
         self.sock.settimeout(10)
-        self.sock.connect((SHOUTCAST_HOST, source_port))
-        R.log(f'   TCP OK (port {source_port})')
+        self.sock.connect((SHOUTCAST_HOST, port))
 
-        # Jelszó küldése
-        self.sock.sendall(f'{SHOUTCAST_PASSWORD}\r\n'.encode())
+        self.sock.sendall(
+            f'{SHOUTCAST_PASSWORD}\r\n'.encode()
+        )
         time.sleep(2)
-
         resp = self._recv()
-        R.log(f'   Válasz: {repr(resp)}')
+        R.log(f'   Válasz: {repr(resp[:100])}')
 
         if 'OK' in resp.upper():
-            self._send_icy_headers()
+            self._send_icy()
+            self.sock.settimeout(None)
             return True
-
-        # Néha a v1 nem mond "OK"-t, hanem egyből fogadja a headert
-        if resp == '':
-            R.log('   Üres válasz, próba headerekkel...')
-            self._send_icy_headers()
-            time.sleep(1)
-            resp2 = self._recv()
-            R.log(f'   Válasz headerek után: {repr(resp2)}')
-            if 'OK' in resp2.upper() or resp2 == '':
-                # Teszteljünk egy kis adat küldéssel
-                return self._test_send()
-
         return False
 
-    # ---- Method 2: SHOUTcast v2 SOURCE protocol ----
     def _try_v2_source(self):
-        """
-        SHOUTcast v2 DNAS / Icecast-kompatibilis SOURCE metódus
-        HTTP-szerű kérés base64 hitelesítéssel
-        """
-        R.log(f'   Csatlakozás: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        R.log(f'   → {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
+        self.sock = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        )
         self.sock.settimeout(10)
         self.sock.connect((SHOUTCAST_HOST, SHOUTCAST_PORT))
-        R.log(f'   TCP OK (port {SHOUTCAST_PORT})')
 
-        # Base64 hitelesítés
-        auth_str = base64.b64encode(
+        auth = base64.b64encode(
             f'source:{SHOUTCAST_PASSWORD}'.encode()
         ).decode()
-
-        # SOURCE kérés (SHOUTcast v2 stílus)
-        http_req = (
+        req = (
             f'SOURCE /sid=1 ICE/1.0\r\n'
             f'Content-Type: audio/mpeg\r\n'
-            f'Authorization: Basic {auth_str}\r\n'
-            f'User-Agent: SzabyRadio/2.0\r\n'
+            f'Authorization: Basic {auth}\r\n'
+            f'User-Agent: SzabyRadio/4.0\r\n'
             f'ice-name: {STATION_NAME}\r\n'
             f'ice-genre: {STATION_GENRE}\r\n'
             f'ice-bitrate: {BITRATE}\r\n'
-            f'ice-private: 0\r\n'
             f'ice-public: 1\r\n'
-            f'ice-url: {STATION_URL}\r\n'
             f'\r\n'
         )
-
-        R.log(f'   SOURCE kérés küldése...')
-        self.sock.sendall(http_req.encode())
+        self.sock.sendall(req.encode())
         time.sleep(2)
-
         resp = self._recv()
-        R.log(f'   Válasz: {repr(resp)}')
+        R.log(f'   Válasz: {repr(resp[:100])}')
 
         if '200' in resp or 'OK' in resp.upper():
+            self.sock.settimeout(None)
             return True
-        if resp == '':
-            return self._test_send()
-
         return False
 
-    # ---- Method 3: SHOUTcast v1 on base port ----
     def _try_v1_base(self):
-        """Klasszikus v1 protokoll az alap porton"""
-        R.log(f'   Csatlakozás: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        R.log(f'   → {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
+        self.sock = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        )
         self.sock.settimeout(10)
         self.sock.connect((SHOUTCAST_HOST, SHOUTCAST_PORT))
-        R.log(f'   TCP OK (port {SHOUTCAST_PORT})')
 
-        # Jelszó küldése \r\n-nel
-        self.sock.sendall(f'{SHOUTCAST_PASSWORD}\r\n'.encode())
+        self.sock.sendall(
+            f'{SHOUTCAST_PASSWORD}\r\n'.encode()
+        )
         time.sleep(2)
-
         resp = self._recv()
-        R.log(f'   Válasz: {repr(resp)}')
+        R.log(f'   Válasz: {repr(resp[:100])}')
 
         if 'OK' in resp.upper():
-            self._send_icy_headers()
+            self._send_icy()
+            self.sock.settimeout(None)
             return True
         return False
 
-    # ---- Method 4: v1 with just \n ----
-    def _try_v1_alt(self):
-        """v1 protokoll csak \\n sorvégzéssel"""
-        R.log(f'   Csatlakozás: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10)
-        self.sock.connect((SHOUTCAST_HOST, SHOUTCAST_PORT))
-        R.log(f'   TCP OK')
-
-        self.sock.sendall(f'{SHOUTCAST_PASSWORD}\n'.encode())
-        time.sleep(2)
-
-        resp = self._recv()
-        R.log(f'   Válasz: {repr(resp)}')
-
-        if 'OK' in resp.upper():
-            self._send_icy_headers_alt()
-            return True
-        return False
-
-    # ---- Method 5: Icecast PUT ----
     def _try_icecast_put(self):
-        """Icecast-kompatibilis PUT metódus"""
-        R.log(f'   Csatlakozás: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        R.log(f'   → {SHOUTCAST_HOST}:{SHOUTCAST_PORT}')
+        self.sock = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        )
         self.sock.settimeout(10)
         self.sock.connect((SHOUTCAST_HOST, SHOUTCAST_PORT))
 
-        auth_str = base64.b64encode(
+        auth = base64.b64encode(
             f'source:{SHOUTCAST_PASSWORD}'.encode()
         ).decode()
-
-        http_req = (
+        req = (
             f'PUT / HTTP/1.1\r\n'
             f'Host: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}\r\n'
-            f'Authorization: Basic {auth_str}\r\n'
-            f'User-Agent: SzabyRadio/2.0\r\n'
+            f'Authorization: Basic {auth}\r\n'
             f'Content-Type: audio/mpeg\r\n'
             f'ice-name: {STATION_NAME}\r\n'
-            f'ice-genre: {STATION_GENRE}\r\n'
             f'ice-bitrate: {BITRATE}\r\n'
-            f'ice-public: 1\r\n'
-            f'Expect: 100-continue\r\n'
             f'Transfer-Encoding: chunked\r\n'
             f'\r\n'
         )
-
-        self.sock.sendall(http_req.encode())
+        self.sock.sendall(req.encode())
         time.sleep(2)
-
         resp = self._recv()
-        R.log(f'   Válasz: {repr(resp)}')
+        R.log(f'   Válasz: {repr(resp[:100])}')
 
-        if '200' in resp or '100' in resp or 'OK' in resp.upper():
+        if any(x in resp for x in ['200', '100']) \
+                or 'OK' in resp.upper():
+            self.sock.settimeout(None)
             return True
         return False
 
-    # ---- Helper methods ----
     def _recv(self):
         try:
-            data = self.sock.recv(4096)
-            return data.decode(errors='ignore').strip()
-        except socket.timeout:
-            return ''
+            return self.sock.recv(4096).decode(
+                errors='ignore'
+            ).strip()
         except Exception:
             return ''
 
-    def _send_icy_headers(self):
-        headers = (
+    def _send_icy(self):
+        h = (
             f'content-type:audio/mpeg\r\n'
             f'icy-name:{STATION_NAME}\r\n'
             f'icy-genre:{STATION_GENRE}\r\n'
@@ -288,32 +303,7 @@ class ShoutcastSource:
             f'icy-br:{BITRATE}\r\n'
             f'\r\n'
         )
-        self.sock.sendall(headers.encode())
-
-    def _send_icy_headers_alt(self):
-        headers = (
-            f'content-type:audio/mpeg\n'
-            f'icy-name:{STATION_NAME}\n'
-            f'icy-genre:{STATION_GENRE}\n'
-            f'icy-url:{STATION_URL}\n'
-            f'icy-pub:1\n'
-            f'icy-br:{BITRATE}\n'
-            f'\n'
-        )
-        self.sock.sendall(headers.encode())
-
-    def _test_send(self):
-        """Teszt: küldünk néhány byte üres MP3 adatot"""
-        try:
-            # Minimal MP3 frame header (silent frame)
-            silent = b'\xff\xfb\x90\x00' + b'\x00' * 417
-            self.sock.sendall(silent)
-            time.sleep(0.5)
-            self.sock.settimeout(None)
-            return True
-        except Exception as e:
-            R.log(f'   Teszt küldés hiba: {e}')
-            return False
+        self.sock.sendall(h.encode())
 
     def send(self, data):
         if not self.alive:
@@ -326,6 +316,29 @@ class ShoutcastSource:
             self.alive  = False
             R.connected = False
             return False
+
+    def update_meta(self, title):
+        """SHOUTcast metadata frissítés (dal cím)"""
+        if not self.alive:
+            return
+        try:
+            # SHOUTcast v1 metadata update
+            port = SHOUTCAST_PORT
+            meta_url = (
+                f'GET /admin.cgi?pass={SHOUTCAST_PASSWORD}'
+                f'&mode=updinfo&song={title}\r\n'
+                f'User-Agent: SzabyRadio/4.0\r\n'
+                f'\r\n'
+            )
+            s = socket.socket(
+                socket.AF_INET, socket.SOCK_STREAM
+            )
+            s.settimeout(5)
+            s.connect((SHOUTCAST_HOST, port))
+            s.sendall(meta_url.encode())
+            s.close()
+        except Exception:
+            pass  # Nem kritikus
 
     def disconnect(self):
         self.alive  = False
@@ -347,124 +360,70 @@ class ShoutcastSource:
 
 
 # =============================================
-#  FFMPEG DIRECT ICECAST MODE
-#  (Alternatív módszer - ffmpeg maga csatlakozik)
-# =============================================
-class FFmpegDirectMode:
-    """
-    Nem socket-alapú: ffmpeg közvetlenül csatlakozik
-    a SHOUTcast szerverre icecast protokollon.
-    """
-
-    @staticmethod
-    def play(youtube_url):
-        title = yt_get_title(youtube_url)
-        R.current = {'title': title, 'url': youtube_url}
-        R.log(f'🎵 [Direct] Most szól: {title}')
-
-        audio_url = yt_get_audio_url(youtube_url)
-        if not audio_url:
-            R.log('❌ Nem sikerült a YouTube audio URL lekérése')
-            return True
-
-        # ffmpeg icecast output URL
-        icecast_url = (
-            f'icecast://source:{SHOUTCAST_PASSWORD}'
-            f'@{SHOUTCAST_HOST}:{SHOUTCAST_PORT}/'
-        )
-
-        cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'warning',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '5',
-            '-i', audio_url,
-            '-vn',
-            '-c:a', 'libmp3lame',
-            '-b:a', f'{BITRATE}k',
-            '-ar', '44100',
-            '-ac', '2',
-            '-f', 'mp3',
-            '-content_type', 'audio/mpeg',
-            icecast_url
-        ]
-
-        R.skip_event.clear()
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            R.ffmpeg_proc = proc
-            R.connected   = True
-
-            while proc.poll() is None and not R.skip_event.is_set() \
-                  and R.streaming:
-                time.sleep(0.5)
-
-            if R.skip_event.is_set():
-                R.log(f'⏭ Kihagyva: {title}')
-            else:
-                R.log(f'✅ Kész: {title}')
-
-            stderr_out = ''
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-                stderr_out = proc.stderr.read().decode(errors='ignore')
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-            if stderr_out:
-                for line in stderr_out.strip().split('\n')[-3:]:
-                    if line.strip():
-                        R.log(f'   ffmpeg: {line.strip()[:120]}')
-
-            return True
-
-        except Exception as e:
-            R.log(f'❌ FFmpeg direct hiba: {e}')
-            return True
-        finally:
-            R.ffmpeg_proc = None
-
-
-# =============================================
 #  YOUTUBE HELPERS
 # =============================================
 def yt_get_title(url):
     try:
+        cmd = get_ytdlp_base() + ['--get-title', url]
         r = subprocess.run(
-            ['yt-dlp', '--get-title', '--no-playlist', url],
-            capture_output=True, text=True, timeout=30
+            cmd, capture_output=True, text=True, timeout=30
         )
         t = r.stdout.strip()
-        return t if t else 'Ismeretlen cím'
+        if t:
+            return t
+        if r.stderr:
+            # Próbáljuk stderr-ből kinyerni a címet
+            R.log(f'   yt-dlp warn: {r.stderr[:150]}')
+        return 'Ismeretlen cím'
     except Exception:
         return 'Ismeretlen cím'
 
 
 def yt_get_audio_url(url):
     try:
+        cmd = get_ytdlp_base() + [
+            '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+            '--get-url', url
+        ]
         r = subprocess.run(
-            ['yt-dlp',
-             '-f', 'bestaudio[ext=m4a]/bestaudio',
-             '--get-url', '--no-playlist', url],
-            capture_output=True, text=True, timeout=30
+            cmd, capture_output=True, text=True, timeout=45
         )
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-        R.log(f'   yt-dlp hiba: {r.stderr[:200] if r.stderr else "?"}')
+            return r.stdout.strip().split('\n')[0]
+        if r.stderr:
+            R.log(f'   yt-dlp: {r.stderr.strip()[:200]}')
         return None
     except Exception as e:
-        R.log(f'   yt-dlp kivétel: {e}')
+        R.log(f'   yt-dlp hiba: {e}')
         return None
+
+
+def yt_download_file(url, path):
+    """Letöltés fájlba — fallback módszer"""
+    try:
+        cmd = get_ytdlp_base() + [
+            '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+            '-x', '--audio-format', 'mp3',
+            '--audio-quality', f'{BITRATE}k',
+            '-o', path, url
+        ]
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=180
+        )
+        if r.returncode == 0 and os.path.exists(path):
+            size = os.path.getsize(path)
+            R.log(f'   ✅ Letöltve: {size//1024} KB')
+            return True
+        if r.stderr:
+            R.log(f'   yt-dlp: {r.stderr[:200]}')
+        return False
+    except Exception as e:
+        R.log(f'   Letöltési hiba: {e}')
+        return False
 
 
 # =============================================
-#  STREAMING ENGINE (SOCKET MODE)
+#  STREAMING ENGINE
 # =============================================
 def _kill(proc):
     if proc is None:
@@ -480,83 +439,128 @@ def _kill(proc):
 
 
 def play_song(sc, youtube_url):
+    """3 módszert próbál sorban"""
     title = yt_get_title(youtube_url)
     R.current = {'title': title, 'url': youtube_url}
     R.log(f'🎵 Most szól: {title}')
 
+    # Metadata frissítés
+    sc.update_meta(title)
+
+    # === 1. módszer: URL stream ===
     audio_url = yt_get_audio_url(youtube_url)
-    if not audio_url:
-        R.log('❌ Audio URL hiba, pipe mód...')
-        return _stream_with_pipe(sc, youtube_url, title)
+    if audio_url:
+        R.log('   → Mód: URL stream')
+        result = _stream_cmd(sc, [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+            '-i', audio_url,
+            '-vn', '-c:a', 'libmp3lame',
+            '-b:a', f'{BITRATE}k',
+            '-ar', '44100', '-ac', '2',
+            '-f', 'mp3', 'pipe:1'
+        ], title)
+        if result != 'empty':
+            return result != 'disconnect'
 
-    return _stream_with_url(sc, audio_url, title)
+    # === 2. módszer: Pipe ===
+    R.log('   → Mód: Pipe')
+    pipe_result = _stream_pipe(sc, youtube_url, title)
+    if pipe_result != 'empty':
+        return pipe_result != 'disconnect'
+
+    # === 3. módszer: Fájl letöltés ===
+    R.log('   → Mód: Fájl letöltés')
+    import tempfile
+    tmp = os.path.join(
+        tempfile.gettempdir(), f'szaby_{int(time.time())}.mp3'
+    )
+    if yt_download_file(youtube_url, tmp):
+        result = _stream_cmd(sc, [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-re', '-i', tmp,
+            '-vn', '-c:a', 'libmp3lame',
+            '-b:a', f'{BITRATE}k',
+            '-ar', '44100', '-ac', '2',
+            '-f', 'mp3', 'pipe:1'
+        ], title)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return result != 'disconnect'
+
+    R.log(f'❌ Nem sikerült lejátszani: {title}')
+    return True  # Következő dalra lépés
 
 
-def _stream_with_url(sc, audio_url, title):
-    cmd = [
-        'ffmpeg', '-hide_banner', '-loglevel', 'error',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', audio_url,
-        '-vn',
-        '-c:a', 'libmp3lame',
-        '-b:a', f'{BITRATE}k',
-        '-ar', '44100',
-        '-ac', '2',
-        '-f', 'mp3',
-        'pipe:1'
-    ]
-    return _do_stream(sc, cmd, title)
-
-
-def _stream_with_pipe(sc, youtube_url, title):
-    yt_cmd = [
-        'yt-dlp', '-f', 'bestaudio', '-o', '-',
-        '--no-playlist', '--no-warnings', youtube_url
-    ]
-    ff_cmd = [
-        'ffmpeg', '-hide_banner', '-loglevel', 'error',
-        '-i', 'pipe:0',
-        '-vn', '-c:a', 'libmp3lame',
-        '-b:a', f'{BITRATE}k',
-        '-ar', '44100', '-ac', '2',
-        '-f', 'mp3', 'pipe:1'
-    ]
+def _stream_pipe(sc, url, title):
+    """yt-dlp stdout → ffmpeg stdin → shoutcast"""
     try:
+        yt_cmd = get_ytdlp_base() + [
+            '-f', 'bestaudio/best',
+            '-o', '-', url
+        ]
         yt_proc = subprocess.Popen(
-            yt_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            yt_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
         R.yt_proc = yt_proc
+
+        ff_cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:0', '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', f'{BITRATE}k',
+            '-ar', '44100', '-ac', '2',
+            '-f', 'mp3', 'pipe:1'
+        ]
         ff_proc = subprocess.Popen(
-            ff_cmd, stdin=yt_proc.stdout,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            ff_cmd,
+            stdin=yt_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
         yt_proc.stdout.close()
-        return _do_stream_proc(sc, ff_proc, yt_proc, title)
+
+        result = _do_stream(sc, ff_proc, title)
+        _kill(yt_proc)
+        R.yt_proc = None
+        return result
+
     except Exception as e:
-        R.log(f'❌ Pipe hiba: {e}')
-        return True
+        R.log(f'   Pipe hiba: {e}')
+        return 'empty'
 
 
-def _do_stream(sc, ffmpeg_cmd, title):
+def _stream_cmd(sc, cmd, title):
+    """FFmpeg parancs indítása és streamelés"""
     try:
         proc = subprocess.Popen(
-            ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
-        return _do_stream_proc(sc, proc, None, title)
+        return _do_stream(sc, proc, title)
     except Exception as e:
         R.log(f'❌ FFmpeg hiba: {e}')
-        return True
+        return 'empty'
 
 
-def _do_stream_proc(sc, ff_proc, yt_proc, title):
+def _do_stream(sc, ff_proc, title):
+    """
+    Olvassa az ffmpeg kimenetet és küldi a SHOUTcast-nak.
+    Returns: 'ok', 'skip', 'disconnect', 'empty'
+    """
     R.ffmpeg_proc = ff_proc
     R.skip_event.clear()
 
-    bps       = (BITRATE * 1000) / 8
-    chunk     = 4096
-    t_start   = time.time()
+    bps        = (BITRATE * 1000) / 8
+    chunk      = 4096
+    t_start    = time.time()
     total_sent = 0
 
     try:
@@ -567,13 +571,12 @@ def _do_stream_proc(sc, ff_proc, yt_proc, title):
 
             if not sc.send(data):
                 _kill(ff_proc)
-                if yt_proc:
-                    _kill(yt_proc)
                 R.ffmpeg_proc = None
-                R.yt_proc     = None
-                return False
+                return 'disconnect'
 
             total_sent += len(data)
+
+            # Tempó szabályozás (valós idejű)
             expected = total_sent / bps
             elapsed  = time.time() - t_start
             if expected > elapsed:
@@ -583,32 +586,51 @@ def _do_stream_proc(sc, ff_proc, yt_proc, title):
         R.log(f'❌ Stream hiba: {e}')
 
     _kill(ff_proc)
-    if yt_proc:
-        _kill(yt_proc)
     R.ffmpeg_proc = None
-    R.yt_proc     = None
+
+    if total_sent == 0:
+        return 'empty'
+
+    dur = time.time() - t_start
+    m, s = int(dur // 60), int(dur % 60)
 
     if R.skip_event.is_set():
         R.log(f'⏭ Kihagyva: {title}')
-    else:
-        R.log(f'✅ Kész: {title}')
-    return True
+        return 'skip'
+
+    R.total_played += 1
+    R.log(f'✅ Kész: {title} ({m}:{s:02d})')
+    return 'ok'
 
 
 # =============================================
-#  STREAM WORKER THREAD
+#  STREAM WORKER
 # =============================================
-def stream_worker_socket():
-    """Socket-alapú streaming (próbálja az összes protokollt)"""
+def stream_worker():
     sc = ShoutcastSource()
+    retry_count = 0
+    max_retries = 5
 
-    if not sc.connect():
+    while retry_count < max_retries:
+        if sc.connect():
+            break
+        retry_count += 1
+        R.log(
+            f'🔄 Újrapróbálkozás {retry_count}/{max_retries}'
+            f' (10 mp múlva)...'
+        )
+        time.sleep(10)
+
+    if not sc.alive:
+        R.log('❌ Véglegesen nem sikerült csatlakozni!')
         R.streaming = False
         return
 
+    R.log('🎧 Várakozás zenékre... Adj hozzá YouTube linkeket!')
+
     while R.streaming:
         try:
-            url = R.song_queue.get(timeout=3)
+            url = R.song_queue.get(timeout=5)
         except queue.Empty:
             continue
 
@@ -623,45 +645,27 @@ def stream_worker_socket():
             pass
 
         if not ok and R.streaming:
-            R.log('🔄 Újracsatlakozás...')
+            R.log('🔄 Kapcsolat megszakadt, újracsatlakozás...')
             sc.disconnect()
-            time.sleep(3)
-            if not sc.connect():
-                R.log('❌ Újracsatlakozás sikertelen!')
+            time.sleep(5)
+            reconnected = False
+            for i in range(3):
+                R.log(f'   Próba {i+1}/3...')
+                if sc.connect():
+                    reconnected = True
+                    break
+                time.sleep(5)
+            if not reconnected:
+                R.log('❌ Nem sikerült újracsatlakozni!')
                 break
 
     sc.disconnect()
     R.streaming = False
     R.connected = False
-    R.current   = {'title': 'Nincs zene lejátszás alatt', 'url': ''}
-    R.log('⏹ Stream worker leállt.')
-
-
-def stream_worker_direct():
-    """FFmpeg direct mode (ffmpeg maga csatlakozik a szerverre)"""
-    R.log('🎧 FFmpeg Direct mód indítása...')
-    R.connected = True
-
-    while R.streaming:
-        try:
-            url = R.song_queue.get(timeout=3)
-        except queue.Empty:
-            continue
-
-        with R.lock:
-            if R.display_queue:
-                R.display_queue.pop(0)
-
-        FFmpegDirectMode.play(url)
-        try:
-            R.song_queue.task_done()
-        except ValueError:
-            pass
-
-    R.streaming = False
-    R.connected = False
-    R.current   = {'title': 'Nincs zene lejátszás alatt', 'url': ''}
-    R.log('⏹ Direct worker leállt.')
+    R.current = {
+        'title': 'Nincs zene lejátszás alatt', 'url': ''
+    }
+    R.log('⏹ Stream leállt.')
 
 
 # =============================================
@@ -675,17 +679,17 @@ def index():
         dq = list(R.display_queue)
     return render_template_string(
         HTML_TEMPLATE,
-        station    = STATION_NAME,
-        connected  = R.connected,
-        streaming  = R.streaming,
+        station     = STATION_NAME,
+        connected   = R.connected,
+        streaming   = R.streaming,
         conn_method = R.conn_method,
-        current    = R.current,
-        queue      = dq,
-        logs       = R.logs[-50:],
-        msg        = msg,
-        msg_type   = msg_type,
-        host       = SHOUTCAST_HOST,
-        port       = SHOUTCAST_PORT
+        current     = R.current,
+        queue       = dq,
+        logs        = R.logs[-60:],
+        msg         = msg,
+        msg_type    = msg_type,
+        js_runtime  = JS_RUNTIME or 'Nincs ❌',
+        total       = R.total_played
     )
 
 
@@ -693,50 +697,55 @@ def index():
 def add_song():
     url = request.form.get('url', '').strip()
     if not url:
-        return redirect('/?msg=Add+meg+a+YouTube+linket!&t=error')
-    if 'youtube.com' not in url and 'youtu.be' not in url:
-        return redirect('/?msg=Csak+YouTube+link+elfogadott!&t=error')
+        return redirect('/?msg=Üres+link!&t=error')
 
-    title = yt_get_title(url)
+    if 'youtube.com' not in url and 'youtu.be' not in url:
+        return redirect('/?msg=Csak+YouTube+link!&t=error')
+
+    # Tisztítás
+    url = url.split('&list=')[0]  # playlist eltávolítás
+
     with R.lock:
-        R.display_queue.append({'title': title, 'url': url})
+        R.display_queue.append({
+            'title': '⏳ Betöltés...', 'url': url
+        })
     R.song_queue.put(url)
-    R.log(f'➕ Hozzáadva: {title}')
+    R.log(f'➕ Hozzáadva: {url[:70]}')
+
+    # Cím háttérben
+    def fetch():
+        t = yt_get_title(url)
+        with R.lock:
+            for item in R.display_queue:
+                if item['url'] == url \
+                        and '⏳' in item['title']:
+                    item['title'] = t
+                    break
+
+    threading.Thread(target=fetch, daemon=True).start()
     return redirect('/?msg=Hozzáadva!&t=success')
 
 
 @app.route('/start', methods=['POST'])
 def start_stream():
-    mode = request.form.get('mode', 'socket')
     if R.streaming:
         return redirect('/?msg=Már+fut!&t=error')
     R.streaming = True
-
-    if mode == 'direct':
-        R.log('▶ Indítás FFmpeg Direct módban...')
-        R.conn_method = 'FFmpeg Direct (Icecast)'
-        R.worker_thread = threading.Thread(
-            target=stream_worker_direct, daemon=True
-        )
-    else:
-        R.log('▶ Indítás Socket módban (auto-detect)...')
-        R.worker_thread = threading.Thread(
-            target=stream_worker_socket, daemon=True
-        )
-
+    R.log('▶ Stream indítása...')
+    R.worker_thread = threading.Thread(
+        target=stream_worker, daemon=True
+    )
     R.worker_thread.start()
-    time.sleep(3)
-    return redirect('/?msg=Stream+elindítva!&t=success')
+    time.sleep(4)
+    return redirect('/?msg=Elindítva!&t=success')
 
 
 @app.route('/stop', methods=['POST'])
 def stop_stream():
     R.streaming = False
     R.skip_event.set()
-    if R.ffmpeg_proc:
-        _kill(R.ffmpeg_proc)
-    if R.yt_proc:
-        _kill(R.yt_proc)
+    _kill(R.ffmpeg_proc)
+    _kill(R.yt_proc)
     R.log('⏹ Leállítás...')
     return redirect('/?msg=Leállítva!&t=success')
 
@@ -744,7 +753,7 @@ def stop_stream():
 @app.route('/skip', methods=['POST'])
 def skip_song():
     if not R.streaming:
-        return redirect('/?msg=Nincs+aktív+stream!&t=error')
+        return redirect('/?msg=Nincs+stream!&t=error')
     R.skip_event.set()
     if R.ffmpeg_proc:
         try:
@@ -767,61 +776,14 @@ def clear_queue():
     return redirect('/?msg=Törölve!&t=success')
 
 
-@app.route('/test', methods=['POST'])
-def test_connection():
-    """Tesztel minden csatlakozási módszert"""
-    R.log('🔍 === KAPCSOLAT TESZT INDÍTÁSA ===')
-
-    # DNS teszt
-    try:
-        ip = socket.gethostbyname(SHOUTCAST_HOST)
-        R.log(f'   DNS OK: {SHOUTCAST_HOST} → {ip}')
-    except Exception as e:
-        R.log(f'   ❌ DNS hiba: {e}')
-        return redirect('/?msg=DNS+hiba!&t=error')
-
-    # Port tesztek
-    for port in [SHOUTCAST_PORT, SHOUTCAST_PORT + 1]:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect((SHOUTCAST_HOST, port))
-            R.log(f'   ✅ Port {port} NYITVA')
-
-            # Próbáljunk olvasni - hátha a szerver küld valamit
-            try:
-                s.settimeout(3)
-                initial = s.recv(4096).decode(errors='ignore')
-                if initial:
-                    R.log(f'      Szerver üzenet: {repr(initial[:200])}')
-                else:
-                    R.log(f'      (nincs kezdeti üzenet)')
-            except socket.timeout:
-                R.log(f'      (nincs kezdeti üzenet)')
-
-            s.close()
-        except Exception as e:
-            R.log(f'   ❌ Port {port} ZÁRT: {e}')
-
-    # SHOUTcast admin panel teszt
-    try:
-        import urllib.request
-        url = f'http://{SHOUTCAST_HOST}:{SHOUTCAST_PORT}'
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0'
-        })
-        resp = urllib.request.urlopen(req, timeout=10)
-        body = resp.read(2000).decode(errors='ignore')
-        R.log(f'   HTTP válasz ({resp.status}): {body[:200]}')
-        if 'shoutcast' in body.lower() or 'SHOUTcast' in body:
-            R.log('   ✅ SHOUTcast szerver észlelve!')
-        if 'icecast' in body.lower():
-            R.log('   ✅ Icecast szerver észlelve!')
-    except Exception as e:
-        R.log(f'   HTTP teszt: {e}')
-
-    R.log('🔍 === TESZT VÉGE ===')
-    return redirect('/?msg=Teszt+kész,+nézd+a+naplót!&t=success')
+# Render.com health check
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'ok',
+        'streaming': R.streaming,
+        'connected': R.connected
+    })
 
 
 @app.route('/api/status')
@@ -835,7 +797,8 @@ def api_status():
         'current':     R.current,
         'queue':       dq,
         'queue_count': len(dq),
-        'logs':        R.logs[-50:]
+        'total':       R.total_played,
+        'logs':        R.logs[-60:]
     })
 
 
@@ -848,235 +811,219 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{ station }} — DJ Panel v2</title>
+<title>{{ station }} — DJ Panel</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{
-  font-family:'Segoe UI',Tahoma,sans-serif;
+body{font-family:'Segoe UI',Tahoma,sans-serif;
   background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);
-  color:#e0e0e0;min-height:100vh;
-}
-.wrap{max-width:960px;margin:0 auto;padding:20px}
+  color:#e0e0e0;min-height:100vh}
+.w{max-width:960px;margin:0 auto;padding:16px}
 
-.hdr{text-align:center;padding:24px 0;margin-bottom:24px;
-     border-bottom:2px solid rgba(255,255,255,.08)}
+.hdr{text-align:center;padding:20px 0 16px;
+  border-bottom:2px solid rgba(255,255,255,.08);margin-bottom:16px}
 .hdr h1{font-size:2.2em;
   background:linear-gradient(45deg,#ff6b6b,#feca57,#48dbfb,#a29bfe);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;
   background-clip:text}
-.hdr .sub{color:#777;font-size:.95em;margin-top:4px}
-.hdr .ver{color:#555;font-size:.75em;margin-top:2px}
+.hdr .s{color:#666;font-size:.85em;margin-top:4px}
 
-.flash{padding:12px 20px;border-radius:10px;margin-bottom:16px;font-weight:500}
-.flash.success{background:rgba(0,184,148,.15);border:1px solid #00b894;color:#55efc4}
-.flash.error{background:rgba(214,48,49,.15);border:1px solid #d63031;color:#ff7675}
+.fl{padding:10px 18px;border-radius:10px;margin-bottom:14px;
+  font-weight:500;font-size:.9em}
+.fl.ok{background:rgba(0,184,148,.15);border:1px solid #00b894;
+  color:#55efc4}
+.fl.err{background:rgba(214,48,49,.15);border:1px solid #d63031;
+  color:#ff7675}
 
-/* Warning box */
-.warn{background:rgba(253,203,110,.1);border:1px solid #fdcb6e;
-      border-radius:12px;padding:16px 20px;margin-bottom:18px;color:#ffeaa7}
-.warn b{color:#fdcb6e}
-.warn a{color:#74b9ff;text-decoration:underline}
+.chips{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.ch{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+  border-radius:8px;padding:5px 12px;font-size:.75em}
+.ch b{margin-right:3px}
+.ch.g{border-color:#00b894;color:#55efc4}
+.ch.r{border-color:#d63031;color:#ff7675}
+.ch.y{border-color:#fdcb6e;color:#feca57}
 
-.status-bar{display:flex;justify-content:space-between;align-items:center;
-  background:rgba(255,255,255,.04);border-radius:14px;padding:14px 22px;
-  margin-bottom:18px;border:1px solid rgba(255,255,255,.08);flex-wrap:wrap;gap:10px}
-.status-ind{display:flex;align-items:center;gap:10px;font-weight:500}
-.dot{width:13px;height:13px;border-radius:50%;flex-shrink:0}
-.dot.on{background:#00ff88;box-shadow:0 0 12px #00ff88;animation:pulse 2s infinite}
-.dot.off{background:#ff4757;box-shadow:0 0 8px #ff4757}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.method-badge{font-size:.72em;background:rgba(108,92,231,.3);
-  padding:3px 10px;border-radius:6px;color:#a29bfe;margin-left:6px}
-.controls{display:flex;gap:6px;flex-wrap:wrap}
+.sb{display:flex;justify-content:space-between;align-items:center;
+  background:rgba(255,255,255,.04);border-radius:14px;padding:12px 20px;
+  margin-bottom:16px;border:1px solid rgba(255,255,255,.08);
+  flex-wrap:wrap;gap:8px}
+.si{display:flex;align-items:center;gap:8px;font-weight:500}
+.d{width:12px;height:12px;border-radius:50%}
+.d.on{background:#00ff88;box-shadow:0 0 10px #00ff88;
+  animation:p 2s infinite}
+.d.off{background:#ff4757;box-shadow:0 0 6px #ff4757}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+.bg{font-size:.65em;background:rgba(108,92,231,.3);
+  padding:2px 8px;border-radius:5px;color:#a29bfe}
+.ct{display:flex;gap:5px;flex-wrap:wrap}
 
-.btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;
-     font-size:12px;font-weight:700;transition:.25s;text-transform:uppercase;
-     letter-spacing:.6px;color:#fff}
-.btn:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,0,0,.35)}
-.btn-go{background:linear-gradient(135deg,#00b894,#00cec9)}
-.btn-go2{background:linear-gradient(135deg,#6c5ce7,#a29bfe)}
-.btn-stop{background:linear-gradient(135deg,#e17055,#d63031)}
-.btn-skip{background:linear-gradient(135deg,#fdcb6e,#e17055)}
-.btn-clr{background:linear-gradient(135deg,#636e72,#2d3436)}
-.btn-test{background:linear-gradient(135deg,#0984e3,#74b9ff)}
+.bt{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;
+  font-size:11px;font-weight:700;transition:.2s;text-transform:uppercase;
+  letter-spacing:.5px;color:#fff}
+.bt:hover{transform:translateY(-1px);
+  box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.bt:active{transform:translateY(0)}
+.bt.go{background:linear-gradient(135deg,#00b894,#00cec9)}
+.bt.st{background:linear-gradient(135deg,#e17055,#d63031)}
+.bt.sk{background:linear-gradient(135deg,#fdcb6e,#e17055)}
+.bt.cl{background:linear-gradient(135deg,#636e72,#2d3436)}
 
-.card{background:rgba(255,255,255,.04);border-radius:14px;padding:20px 24px;
-      margin-bottom:18px;border:1px solid rgba(255,255,255,.07)}
-.card h3{font-size:.8em;text-transform:uppercase;letter-spacing:2px;
-         margin-bottom:10px;font-weight:700}
-.card h3.cyan{color:#48dbfb}
-.card h3.yellow{color:#feca57}
-.card h3.red{color:#ff6b6b}
-.card h3.green{color:#00ff88}
-.card h3.purple{color:#a29bfe}
+.cd{background:rgba(255,255,255,.04);border-radius:14px;padding:18px 22px;
+  margin-bottom:14px;border:1px solid rgba(255,255,255,.07)}
+.cd h3{font-size:.75em;text-transform:uppercase;letter-spacing:2px;
+  margin-bottom:8px;font-weight:700}
+.cd h3.c{color:#48dbfb}
+.cd h3.y{color:#feca57}
+.cd h3.re{color:#ff6b6b}
 
-#current-title{font-size:1.3em;font-weight:600;color:#fff;word-break:break-word}
+.np{display:flex;align-items:center;gap:14px}
+.eq{display:flex;align-items:flex-end;gap:3px;height:28px}
+.eq i{width:4px;background:#48dbfb;border-radius:2px;display:block;
+  animation:e .8s ease-in-out infinite alternate}
+.eq i:nth-child(1){height:8px;animation-delay:0s}
+.eq i:nth-child(2){height:18px;animation-delay:.15s}
+.eq i:nth-child(3){height:12px;animation-delay:.3s}
+.eq i:nth-child(4){height:22px;animation-delay:.1s}
+.eq i:nth-child(5){height:7px;animation-delay:.25s}
+@keyframes e{to{height:3px}}
+#now{font-size:1.25em;font-weight:600;color:#fff;word-break:break-word}
 
-.input-row{display:flex;gap:10px}
-.input-row input[type=text]{flex:1;padding:12px 16px;border-radius:10px;
-  border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);
-  color:#fff;font-size:14px;outline:none;transition:.3s}
-.input-row input[type=text]:focus{border-color:#a29bfe}
-.input-row input::placeholder{color:#555}
-.btn-add{background:linear-gradient(135deg,#6c5ce7,#a29bfe);color:#fff;
-  padding:12px 24px;border:none;border-radius:10px;cursor:pointer;
-  font-size:14px;font-weight:700;transition:.25s;white-space:nowrap}
-.btn-add:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(108,92,231,.4)}
+.ir{display:flex;gap:8px}
+.ir input{flex:1;padding:11px 14px;border-radius:10px;
+  border:1px solid rgba(255,255,255,.15);
+  background:rgba(255,255,255,.06);color:#fff;font-size:14px;outline:none}
+.ir input:focus{border-color:#a29bfe}
+.ir input::placeholder{color:#555}
+.ba{background:linear-gradient(135deg,#6c5ce7,#a29bfe);color:#fff;
+  padding:11px 22px;border:none;border-radius:10px;cursor:pointer;
+  font-size:14px;font-weight:700;white-space:nowrap}
+.ba:hover{box-shadow:0 4px 12px rgba(108,92,231,.4)}
 
-.q-item{display:flex;align-items:center;padding:9px 13px;
-  background:rgba(255,255,255,.025);border-radius:8px;margin-bottom:6px;
+.qi{display:flex;align-items:center;padding:8px 12px;
+  background:rgba(255,255,255,.025);border-radius:8px;margin-bottom:5px;
   border-left:3px solid #6c5ce7}
-.q-item .num{color:#a29bfe;font-weight:700;margin-right:12px;min-width:22px;
-             text-align:right}
-.q-item .stitle{flex:1;font-size:.9em;word-break:break-word}
-.q-empty{color:#555;text-align:center;padding:16px;font-style:italic}
+.qi .n{color:#a29bfe;font-weight:700;margin-right:10px;min-width:20px;
+  text-align:right;font-size:.85em}
+.qi .t{flex:1;font-size:.88em;word-break:break-word}
+.qe{color:#555;text-align:center;padding:14px;font-style:italic;
+  font-size:.9em}
 
-.log-box{background:rgba(0,0,0,.3);border-radius:12px;padding:16px;
-         margin-bottom:18px;border:1px solid rgba(255,255,255,.04)}
-.log-box h3{color:#55efc4;font-size:.8em;text-transform:uppercase;
-            letter-spacing:2px;margin-bottom:8px}
-#log-content{max-height:260px;overflow-y:auto;font-family:'Courier New',monospace;
-  font-size:.78em;color:#888;line-height:1.65}
-#log-content::-webkit-scrollbar{width:5px}
-#log-content::-webkit-scrollbar-thumb{background:#444;border-radius:3px}
+.lb{background:rgba(0,0,0,.3);border-radius:12px;padding:14px;
+  margin-bottom:14px;border:1px solid rgba(255,255,255,.04)}
+.lb h3{color:#55efc4;font-size:.75em;text-transform:uppercase;
+  letter-spacing:2px;margin-bottom:6px}
+#logs{max-height:250px;overflow-y:auto;font-family:'Courier New',monospace;
+  font-size:.75em;color:#888;line-height:1.6}
+#logs::-webkit-scrollbar{width:4px}
+#logs::-webkit-scrollbar-thumb{background:#444;border-radius:3px}
 
-.links{text-align:center;padding:16px;background:rgba(255,255,255,.025);
-       border-radius:12px;border:1px solid rgba(255,255,255,.06)}
-.links h3{color:#48dbfb;font-size:.8em;text-transform:uppercase;
-          letter-spacing:2px;margin-bottom:8px}
-.links a{color:#feca57;text-decoration:none;margin:0 10px;font-weight:500}
-.links a:hover{text-decoration:underline}
+.lk{text-align:center;padding:14px;background:rgba(255,255,255,.025);
+  border-radius:12px;border:1px solid rgba(255,255,255,.06)}
+.lk h3{color:#48dbfb;font-size:.75em;text-transform:uppercase;
+  letter-spacing:2px;margin-bottom:6px}
+.lk a{color:#feca57;text-decoration:none;margin:0 8px;font-weight:500;
+  font-size:.9em}
+.lk a:hover{text-decoration:underline}
 
-.mode-box{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;
-          align-items:center;justify-content:center}
-.mode-box label{font-size:.85em;color:#aaa}
-.mode-desc{font-size:.72em;color:#666;margin-top:6px;text-align:center}
+.ft{text-align:center;padding:12px;color:#444;font-size:.7em;
+  margin-top:8px}
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="w">
 
   <div class="hdr">
     <h1>🎵 {{ station }}</h1>
-    <div class="sub">DJ Control Panel</div>
-    <div class="ver">v2.0 — Multi-protocol • {{ host }}:{{ port }}</div>
+    <div class="s">DJ Control Panel v4.0 — Render.com Cloud</div>
   </div>
 
   {% if msg %}
-  <div class="flash {{ msg_type }}">{{ msg }}</div>
+  <div class="fl {{ msg_type }}">{{ msg }}</div>
   {% endif %}
 
-  <!-- WARNING -->
-  <div class="warn">
-    <b>⚠️ FONTOS:</b> A listen2myradio.com panelen a szerverednek
-    <b>ON</b> állapotban kell lennie!
-    <a href="http://uk3freenew.listen2myradio.com:31822/index.html"
-       target="_blank">Admin Panel megnyitása →</a>
+  <div class="chips">
+    <div class="ch {{ 'g' if 'Nincs' not in js_runtime else 'r' }}">
+      <b>JS:</b> {{ js_runtime }}</div>
+    <div class="ch {{ 'g' if connected else 'r' }}">
+      <b>Szerver:</b>
+      {{ 'Online' if connected else 'Offline' }}</div>
+    <div class="ch y"><b>Lejátszva:</b>
+      <span id="tot">{{ total }}</span> dal</div>
   </div>
 
-  <!-- STATUS -->
-  <div class="status-bar">
-    <div class="status-ind">
-      <div class="dot {{ 'on' if connected else 'off' }}" id="status-dot"></div>
-      <span id="status-text">
-        {{ 'ONLINE' if connected else 'OFFLINE' }}
+  <div class="sb">
+    <div class="si">
+      <div class="d {{ 'on' if connected else 'off' }}"
+           id="dot"></div>
+      <span id="st">
+        {{ 'STREAMING' if connected else 'OFFLINE' }}
       </span>
       {% if conn_method and connected %}
-      <span class="method-badge" id="method-badge">{{ conn_method }}</span>
+      <span class="bg">{{ conn_method }}</span>
       {% endif %}
     </div>
-    <div class="controls">
+    <div class="ct">
       {% if not streaming %}
-      <!-- Socket mode -->
       <form action="/start" method="post" style="display:inline">
-        <input type="hidden" name="mode" value="socket">
-        <button class="btn btn-go" type="submit"
-                title="Socket mód - auto-detect protokoll">
-          ▶ Socket Mód
-        </button>
-      </form>
-      <!-- Direct mode -->
-      <form action="/start" method="post" style="display:inline">
-        <input type="hidden" name="mode" value="direct">
-        <button class="btn btn-go2" type="submit"
-                title="FFmpeg közvetlenül csatlakozik icecast protokollon">
-          ▶ Direct Mód
-        </button>
-      </form>
-      <!-- Test -->
-      <form action="/test" method="post" style="display:inline">
-        <button class="btn btn-test" type="submit">🔍 Teszt</button>
-      </form>
+        <button class="bt go">▶ Indítás</button></form>
       {% else %}
       <form action="/stop" method="post" style="display:inline">
-        <button class="btn btn-stop" type="submit">■ Leállítás</button>
-      </form>
+        <button class="bt st">■ Stop</button></form>
       <form action="/skip" method="post" style="display:inline">
-        <button class="btn btn-skip" type="submit">⏭ Következő</button>
-      </form>
+        <button class="bt sk">⏭ Skip</button></form>
       {% endif %}
       <form action="/clear" method="post" style="display:inline">
-        <button class="btn btn-clr" type="submit">🗑</button>
-      </form>
+        <button class="bt cl">🗑</button></form>
     </div>
   </div>
 
-  {% if not streaming %}
-  <div class="mode-desc">
-    <b>Socket Mód:</b> Automatikusan próbálja: v1 port+1, v2 SOURCE,
-    v1 alap, Icecast PUT &nbsp;|&nbsp;
-    <b>Direct Mód:</b> FFmpeg közvetlenül csatlakozik (Icecast protokoll)
-    &nbsp;|&nbsp;
-    <b>Teszt:</b> Portok és szerver ellenőrzése
-  </div>
-  {% endif %}
-
-  <!-- NOW PLAYING -->
-  <div class="card">
-    <h3 class="cyan">🎧 Most Szól</h3>
-    <div id="current-title">{{ current.title }}</div>
+  <div class="cd">
+    <h3 class="c">🎧 Most Szól</h3>
+    <div class="np">
+      {% if connected %}
+      <div class="eq"><i></i><i></i><i></i><i></i><i></i></div>
+      {% endif %}
+      <div id="now">{{ current.title }}</div>
+    </div>
   </div>
 
-  <!-- ADD -->
-  <div class="card">
-    <h3 class="yellow">➕ Zene Hozzáadása</h3>
+  <div class="cd">
+    <h3 class="y">➕ YouTube Link</h3>
     <form action="/add" method="post">
-      <div class="input-row">
+      <div class="ir">
         <input type="text" name="url"
-               placeholder="YouTube link beillesztése..." required>
-        <button type="submit" class="btn-add">Hozzáadás</button>
+          placeholder="https://www.youtube.com/watch?v=..."
+          required autocomplete="off">
+        <button type="submit" class="ba">+ Add</button>
       </div>
     </form>
   </div>
 
-  <!-- QUEUE -->
-  <div class="card">
-    <h3 class="red">📋 Várólista
-      (<span id="queue-count">{{ queue|length }}</span>)</h3>
-    <div id="queue-list">
+  <div class="cd">
+    <h3 class="re">📋 Várólista
+      (<span id="qc">{{ queue|length }}</span>)</h3>
+    <div id="ql">
       {% if queue %}
-        {% for item in queue %}
-        <div class="q-item">
-          <span class="num">{{ loop.index }}.</span>
-          <span class="stitle">{{ item.title }}</span>
+        {% for i in queue %}
+        <div class="qi">
+          <span class="n">{{ loop.index }}.</span>
+          <span class="t">{{ i.title }}</span>
         </div>
         {% endfor %}
       {% else %}
-        <div class="q-empty">Üres várólista</div>
+        <div class="qe">Üres — adj hozzá YouTube linkeket!</div>
       {% endif %}
     </div>
   </div>
 
-  <!-- LOG -->
-  <div class="log-box">
+  <div class="lb">
     <h3>📊 Napló</h3>
-    <div id="log-content">
+    <div id="logs">
       {% for l in logs %}<div>{{ l }}</div>{% endfor %}
     </div>
   </div>
 
-  <!-- LINKS -->
-  <div class="links">
+  <div class="lk">
     <h3>🔗 Hallgatás</h3>
     <a href="http://szaby.radio12345.com" target="_blank">
       szaby.radio12345.com</a>
@@ -1086,47 +1033,44 @@ body{
       szaby.radiostream123.com</a>
   </div>
 
+  <div class="ft">
+    Powered by Render.com ☁️
+  </div>
+
 </div>
 
 <script>
-function esc(s){
-  var d=document.createElement('div');d.textContent=s;return d.innerHTML;
-}
-setInterval(function(){
-  fetch('/api/status')
-    .then(function(r){return r.json()})
-    .then(function(d){
-      document.getElementById('status-dot').className=
-        'dot '+(d.connected?'on':'off');
-      document.getElementById('status-text').textContent=
-        d.connected?'ONLINE':'OFFLINE';
-      document.getElementById('current-title').textContent=
-        d.current.title;
-      document.getElementById('queue-count').textContent=
-        d.queue_count;
-
-      var html='';
-      if(d.queue.length===0){
-        html='<div class="q-empty">Üres várólista</div>';
-      }else{
-        d.queue.forEach(function(it,i){
-          html+='<div class="q-item"><span class="num">'+(i+1)+
-            '.</span><span class="stitle">'+esc(it.title)+'</span></div>';
-        });
-      }
-      document.getElementById('queue-list').innerHTML=html;
-
-      var lh='';
-      d.logs.forEach(function(l){lh+='<div>'+esc(l)+'</div>';});
-      var el=document.getElementById('log-content');
-      el.innerHTML=lh;
-      el.scrollTop=el.scrollHeight;
-    }).catch(function(){});
+function x(s){var d=document.createElement('div');
+  d.textContent=s;return d.innerHTML}
+setInterval(()=>{
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    document.getElementById('dot').className=
+      'd '+(d.connected?'on':'off');
+    document.getElementById('st').textContent=
+      d.connected?'STREAMING':'OFFLINE';
+    document.getElementById('now').textContent=
+      d.current.title;
+    document.getElementById('qc').textContent=
+      d.queue_count;
+    document.getElementById('tot').textContent=
+      d.total;
+    var h='';
+    if(!d.queue.length)
+      h='<div class="qe">Üres</div>';
+    else d.queue.forEach((q,i)=>{
+      h+='<div class="qi"><span class="n">'+(i+1)+
+        '.</span><span class="t">'+x(q.title)+
+        '</span></div>';
+    });
+    document.getElementById('ql').innerHTML=h;
+    var lh='';
+    d.logs.forEach(l=>{lh+='<div>'+x(l)+'</div>';});
+    var el=document.getElementById('logs');
+    el.innerHTML=lh;el.scrollTop=el.scrollHeight;
+  }).catch(()=>{});
 },3000);
-(function(){
-  var el=document.getElementById('log-content');
-  if(el)el.scrollTop=el.scrollHeight;
-})();
+(()=>{var el=document.getElementById('logs');
+  if(el)el.scrollTop=el.scrollHeight})();
 </script>
 </body>
 </html>
@@ -1134,41 +1078,24 @@ setInterval(function(){
 
 
 # =============================================
-#  STARTUP
+#  MAIN
 # =============================================
-def check_deps():
-    missing = []
-    for prog in ['yt-dlp', 'ffmpeg']:
-        try:
-            subprocess.run(
-                [prog, '--version'],
-                capture_output=True, timeout=10
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            missing.append(prog)
-
-    if missing:
-        print(f'\n❌ Hiányzó: {", ".join(missing)}')
-        if 'yt-dlp' in missing:
-            print('  pip install yt-dlp')
-        if 'ffmpeg' in missing:
-            print('  https://ffmpeg.org/download.html')
-        sys.exit(1)
-
-
 if __name__ == '__main__':
-    check_deps()
-
     print(f"""
-╔═══════════════════════════════════════════════════╗
-║   🎵  {STATION_NAME} — DJ Panel v2.0              ║
-║                                                   ║
-║   Web:    http://localhost:{WEB_PORT}                    ║
-║   Server: {SHOUTCAST_HOST}:{SHOUTCAST_PORT}            ║
-║                                                   ║
-║   ⚠️  Először kapcsold BE a szervert a             ║
-║      listen2myradio.com admin panelen!             ║
-╚═══════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║  🎵  {STATION_NAME}                           ║
+║  v4.0 — Render.com Cloud Edition              ║
+║                                               ║
+║  Web Panel:  http://0.0.0.0:{WEB_PORT}              ║
+║  SHOUTcast:  {SHOUTCAST_HOST}:{SHOUTCAST_PORT}    ║
+║  JS Runtime: {(JS_RUNTIME or 'NINCS'):<32}║
+╚═══════════════════════════════════════════════╝
     """)
 
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, threaded=True)
+    # Render.com: 0.0.0.0 és PORT env variable
+    app.run(
+        host='0.0.0.0',
+        port=WEB_PORT,
+        debug=False,
+        threaded=True
+    )
