@@ -35,8 +35,9 @@ app = Flask(__name__)
 #  JS RUNTIME DETEKCIÓ
 # =============================================
 def detect_js_runtime():
+    # JAVÍTÁS: A 'nodejs' nevet 'node'-ra cseréltük a yt-dlp kompatibilitás miatt
     for name, cmd in [
-        ('nodejs', ['node', '--version']),
+        ('node',   ['node', '--version']),
         ('deno',   ['deno', '--version']),
     ]:
         try:
@@ -372,7 +373,6 @@ def yt_get_title(url):
         if t:
             return t
         if r.stderr:
-            # Próbáljuk stderr-ből kinyerni a címet
             R.log(f'   yt-dlp warn: {r.stderr[:150]}')
         return 'Ismeretlen cím'
     except Exception:
@@ -699,9 +699,9 @@ def add_song():
     if not url:
         return redirect('/?msg=Üres+link!&t=error')
 
-    # JAVÍTVA: Most már elfogad minden normál YouTube linket
+    # JAVÍTÁS: Szélesebb körű URL elfogadás (youtube.com vagy youtu.be)
     if 'youtube.com' not in url and 'youtu.be' not in url:
-        return redirect('/?msg=Csak+YouTube+linket+adj+meg!&t=error')
+        return redirect('/?msg=Csak+YouTube+link!&t=error')
 
     # Tisztítás
     url = url.split('&list=')[0]  # playlist eltávolítás
