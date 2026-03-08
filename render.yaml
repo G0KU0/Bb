@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: szaby-radio
+    runtime: docker
+    plan: free
+    envVars:
+      - key: SHOUTCAST_HOST
+        value: uk3freenew.listen2myradio.com
+      - key: SHOUTCAST_PORT
+        value: "31822"
+      - key: SHOUTCAST_PASSWORD
+        value: "2002"
+      - key: STATION_NAME
+        value: "Szaby Radio"
+      - key: BITRATE
+        value: "128"
