@@ -35,7 +35,6 @@ app = Flask(__name__)
 #  JS RUNTIME DETEKCIÓ
 # =============================================
 def detect_js_runtime():
-    # JAVÍTÁS: A 'nodejs' nevet 'node'-ra cseréltük a yt-dlp kompatibilitás miatt
     for name, cmd in [
         ('node',   ['node', '--version']),
         ('deno',   ['deno', '--version']),
@@ -102,6 +101,12 @@ def get_ytdlp_base():
     if JS_RUNTIME:
         args.extend(['--js-runtimes', JS_RUNTIME])
     args.append('--no-playlist')
+    
+    # JAVÍTÁS: YouTube Bot-védelem (Sign in to confirm you're not a bot) megkerülése
+    # Ez arra utasítja a yt-dlp-t, hogy úgy tegyen, mintha az Androidos vagy iOS appból kérné a zenét, 
+    # amit a YouTube kevésbé blokkol.
+    args.extend(['--extractor-args', 'youtube:player_client=android,ios'])
+    
     return args
 
 
@@ -699,7 +704,6 @@ def add_song():
     if not url:
         return redirect('/?msg=Üres+link!&t=error')
 
-    # JAVÍTÁS: Szélesebb körű URL elfogadás (youtube.com vagy youtu.be)
     if 'youtube.com' not in url and 'youtu.be' not in url:
         return redirect('/?msg=Csak+YouTube+link!&t=error')
 
